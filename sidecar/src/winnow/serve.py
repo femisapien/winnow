@@ -11,7 +11,9 @@ period.
 ``winnow serve --ensure`` is what the SessionStart hook runs: it checks the
 health endpoint and spawns a detached server if nothing answers. It prints
 nothing on stdout, because SessionStart stdout is injected into Claude's
-context.
+context. ``winnow serve --revive`` is what the module runs when a POST reaches
+nobody mid-session (the server exited after its idle period): the same start,
+unless ``winnow serve --stop`` turned the sidecar off on purpose.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -33,6 +36,12 @@ from winnow.config import Config, default_home, env_file_path, load_env_file
 DEFAULT_PORT = 47311
 DEFAULT_IDLE_MINUTES = 45
 EVENTS = {"/hook/post-tool-use": "post-tool-use", "/hook/user-prompt-submit": "user-prompt-submit"}
+
+# `winnow serve --revive` exit codes, which the hook module reads; keep them equal to hooks/winnow.ts.
+REVIVE_STARTED = 0
+REVIVE_FAILED = 1
+REVIVE_STOPPED = 3
+REVIVE_RUNNING = 4
 
 
 class State:
@@ -281,6 +290,50 @@ def stop(port: int = DEFAULT_PORT) -> bool:
             return True
     except (URLError, OSError):
         return False
+
+
+def stopped_marker() -> Path:
+    """Present while the sidecar is off on purpose: `winnow serve --stop` writes it, a session start removes it."""
+    return default_home() / "stopped"
+
+
+def mark_stopped() -> None:
+    try:
+        marker = stopped_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_stopped() -> None:
+    try:
+        stopped_marker().unlink()
+    except OSError:  # FileNotFoundError included: nothing to clear
+        pass
+
+
+def is_stopped() -> bool:
+    try:
+        return stopped_marker().exists()
+    except OSError:
+        return False
+
+
+def revive(port: int = DEFAULT_PORT) -> int:
+    """What the hook module runs when a POST reached nobody: start the sidecar again.
+
+    Unless it was stopped on purpose, since a session left open must not bring back a
+    sidecar someone turned off. The exit code tells the module whether resending can
+    help: only after a start. A sidecar that was answering all along means the POST
+    failed for some other reason, and resending would just repeat it.
+    """
+    if is_stopped():
+        return REVIVE_STOPPED
+    info = health(port)
+    if info is not None and info.get("version") == __version__:
+        return REVIVE_RUNNING
+    return REVIVE_STARTED if ensure(port) else REVIVE_FAILED
 
 
 def ensure(port: int = DEFAULT_PORT, wait_s: float = 8.0) -> bool:

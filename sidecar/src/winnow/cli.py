@@ -135,8 +135,10 @@ def run_doctor(loaded_from_env_file: list[str]) -> int:
     info = serve_mod.health(port)
     if info:
         print(f"sidecar                  running on 127.0.0.1:{port} (pid {info.get('pid')}, {info.get('requests')} requests, judge {'ready' if info.get('judge_ready') else 'not built yet'})")
+    elif serve_mod.is_stopped():
+        print(f"sidecar                  not running on 127.0.0.1:{port}: stopped with `winnow serve --stop`; the next session start (or `winnow serve --ensure`) runs it again")
     else:
-        print(f"sidecar                  not running on 127.0.0.1:{port} (started by the SessionStart hook; `winnow serve --ensure` starts one)")
+        print(f"sidecar                  not running on 127.0.0.1:{port} (a session start runs it, and an open session restarts it when it next needs it; `winnow serve --ensure` starts one now)")
     flag = function_hooks_flag()
     if flag == "settings":
         print("function hooks           enabled in ~/.claude/settings.json")
@@ -319,7 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=None, help="default: WINNOW_PORT or 47311")
     serve.add_argument("--idle-minutes", type=float, default=45, help="exit after this long without a request")
     serve.add_argument("--ensure", action="store_true", help="start a detached server only if none is running (SessionStart)")
-    serve.add_argument("--stop", action="store_true")
+    serve.add_argument("--stop", action="store_true", help="stop it; sessions already open leave it stopped")
+    serve.add_argument(
+        "--revive",
+        action="store_true",
+        help="start it again unless --stop turned it off (what the hook module runs when it stops answering)",
+    )
     serve.add_argument("--status", action="store_true")
 
     clean = sub.add_parser("clean", help="delete old cache entries")
@@ -401,9 +408,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(info, indent=2) if info else f"no sidecar answering on 127.0.0.1:{port}")
             return 0 if info else 1
         if args.stop:
-            print("stopped" if serve_mod.stop(port) else f"no sidecar answering on 127.0.0.1:{port}")
+            serve_mod.mark_stopped()  # so the module in an open session does not start it again
+            if serve_mod.stop(port):
+                print("stopped (sessions already open will not restart it; the next session start will)")
+            else:
+                print(f"no sidecar answering on 127.0.0.1:{port}")
             return 0
+        if args.revive:
+            return serve_mod.revive(port)  # silent: the module reads the exit code
         if args.ensure:
+            serve_mod.clear_stopped()  # a session starting means winnow is wanted again
             ok = serve_mod.ensure(port)
             return 0 if ok else 1  # silent: SessionStart stdout would go into Claude's context
         return serve_mod.run_server(port=port, idle_minutes=args.idle_minutes)

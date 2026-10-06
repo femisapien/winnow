@@ -1,4 +1,4 @@
-"""What the function-hook module relies on: a task override, a guessed transcript path, and the X-Winnow header."""
+"""What the function-hook module relies on: the task read from the transcript (or a task it sends), and the X-Winnow header."""
 
 import json
 import threading
@@ -8,7 +8,7 @@ import pytest
 
 from winnow import serve
 from winnow.hooks import Runtime
-from winnow.transcript import guess_transcript_path, task_from_payload, transcript_for
+from winnow.transcript import find_transcript, guess_transcript_path, task_from_payload, transcript_for
 
 
 def numbered(n):
@@ -127,3 +127,44 @@ def test_decisions_record_the_source(server, cfg):
     post(srv, "/hook/post-tool-use", payload("t7"))
     events = [e for e in log.read_events(cfg) if e.get("tool_use_id") == "t7"]
     assert events and events[-1]["source"] == "function-hook"
+
+
+def test_a_session_that_changed_directory_still_finds_its_transcript(tmp_path, monkeypatch):
+    monkeypatch.setenv("WINNOW_TRANSCRIPTS_ROOT", str(tmp_path))
+    main = tmp_path / "C--Work-app" / "s10.jsonl"
+    main.parent.mkdir(parents=True)
+    main.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "C--Work-other").mkdir()
+    # Started in C:\Work\app, working in a subdirectory now: the guess misses and the search finds it.
+    assert transcript_for({"session_id": "s10", "cwd": r"C:\Work\app\sidecar"}) == str(main)
+    sub = main.parent / "s10" / "subagents" / "agent-a2.jsonl"
+    sub.parent.mkdir(parents=True)
+    sub.write_text("{}\n", encoding="utf-8")
+    assert transcript_for({"session_id": "s10", "cwd": r"C:\Work\app\sidecar", "agent_id": "a2"}) == str(sub)
+
+
+def test_the_search_takes_only_a_plain_session_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("WINNOW_TRANSCRIPTS_ROOT", str(tmp_path / "projects"))
+    (tmp_path / "projects" / "p").mkdir(parents=True)
+    (tmp_path / "secret.jsonl").write_text("{}\n", encoding="utf-8")
+    assert find_transcript("../../secret") is None
+    assert find_transcript("..") is None
+    assert find_transcript("nobody") is None
+
+
+def test_without_a_task_the_judge_reads_it_from_the_transcript(server, tmp_path, monkeypatch):
+    """What the module sends since 0.5.2: no task, so the sidecar reads the transcript's tail."""
+    monkeypatch.setenv("WINNOW_TRANSCRIPTS_ROOT", str(tmp_path / "projects"))
+    transcript = tmp_path / "projects" / "C--Work-app" / "s11.jsonl"
+    transcript.parent.mkdir(parents=True)
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "Find why the nightly build fails"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Reading the build log."}]}},
+    ]
+    transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    srv, judge = server
+    body = payload("t9", session_id="s11", cwd=r"C:\Work\app\ci")
+    del body["task"]
+    status, _, _ = post(srv, "/hook/post-tool-use", body)
+    assert status == 200 and len(judge.calls) == 1
+    assert judge.calls[0][0]["task"] == {"user_request": "Find why the nightly build fails", "assistant_intent": "Reading the build log."}

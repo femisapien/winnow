@@ -246,7 +246,7 @@ First results on 300 real cases, 97 blind hand labels, three question sets and t
 
 ## How it hooks in
 
-winnow is a Claude Code **function-hook** plugin: a TypeScript module, [`hooks/winnow.ts`](hooks/winnow.ts), that the engine loads in-process. Its `tool.call` handler wraps every Read, Bash and Grep call, hands the result to the sidecar with the task read from the live session, and returns the sidecar's rewrite as the tool's result; its `prompt.submit` handler appends the selected context files to the prompt. Function hooks are early access, behind a flag, on Claude Code 2.1.260 or newer. Without the flag the module never loads and winnow does nothing; `winnow doctor` says so.
+winnow is a Claude Code **function-hook** plugin: a TypeScript module, [`hooks/winnow.ts`](hooks/winnow.ts), that the engine loads in-process. Its `tool.call` handler wraps every Read, Bash and Grep call, hands the result to the sidecar (which reads the task from the session's transcript), and returns the sidecar's rewrite as the tool's result; its `prompt.submit` handler appends the selected context files to the prompt. Function hooks are early access, behind a flag; winnow is tested on Claude Code 2.1.277 and later. Without the flag the module never loads and winnow does nothing; `winnow doctor` says so.
 
 When a result is rewritten you see a toast: `winnow: hid 3 of 8 blocks of Read (5.1k to 1.8k chars; winnow_recall ab12)`. Small results never leave the process; the judging, thresholds and cache are all in the Python sidecar, so nothing measured below changes with the hook mechanism.
 
@@ -260,16 +260,16 @@ For editor types, run `/plugin-types ./.claude/types` inside a Claude Code sessi
 
 ## The resident sidecar
 
-The module posts every large result to `winnow serve` on `127.0.0.1:47311`. The SessionStart hook runs `winnow serve --ensure`, which starts a detached server if none is answering and replaces one left over from an older plugin version. The server keeps the SDK loaded and the judge's connection warm, re-reads `~/.winnow/env` whenever it changes, and exits after 45 idle minutes.
+The module posts every large result to `winnow serve` on `127.0.0.1:47311`. The SessionStart hook runs `winnow serve --ensure`, which starts a detached server if none is answering and replaces one left over from an older plugin version. The server keeps the SDK loaded and the judge's connection warm, re-reads `~/.winnow/env` whenever it changes, and exits after 45 idle minutes. When a session needs it again, the module starts it (`winnow serve --revive`) and resends.
 
 ```bash
 winnow serve --status   # is it up, how many requests, is the judge built
-winnow serve --stop
+winnow serve --stop     # off until the next session start; sessions already open won't restart it
 winnow serve --ensure   # what SessionStart runs; prints nothing
 winnow bench --http     # 381 ms for a Python start per call vs 16 ms through the resident sidecar, on the machine this was built on
 ```
 
-If the server is down, results pass through unjudged (`claude --debug` logs `winnow: sidecar not answering`); the next session start brings it back. Set `WINNOW_PORT` and `PORT` in `hooks/winnow.ts` together if the port is taken.
+If the server is down and cannot be started, results pass through unjudged, winnow says so once, and `winnow doctor` says why. After a failed start the module waits a minute before trying again, so a dead sidecar costs nothing per call. Set `WINNOW_PORT` and `PORT` in `hooks/winnow.ts` together if the port is taken.
 
 ## Housekeeping
 
@@ -303,12 +303,21 @@ winnow recall a1b2c3d4e5f6 --start 41 --end 188
 Working and silently disabled look the same from inside a session, so check in this order.
 
 1. **Is the plugin enabled?** `claude plugin list` should show `winnow@winnow` as enabled. Enable with `claude plugin enable winnow@winnow` and start a new session.
-2. **Is the sidecar up?** `winnow serve --status`. If not, `winnow serve --ensure` starts it; the SessionStart hook does the same. While it is down, results pass through and `claude --debug` logs `winnow: sidecar not answering`.
+2. **Is the sidecar up?** `winnow serve --status`. If not, `winnow serve --ensure` starts it; the SessionStart hook does the same, and an open session starts it again when it next needs it. When it can't be started, results pass through, winnow shows one message saying so, and `claude --debug` logs why.
 3. **Can the judge start?** `winnow doctor`. The common failure is a missing key, or a key set in a terminal that the desktop app never sees. When the judge can't start, winnow also posts one message per session saying so.
 4. **Did it fire?** `tail -1 ~/.winnow/decisions.jsonl` after reading a large file. A line with `"rewritten": true` and a `key` means a stub went to Claude. `"reason": "nothing_to_prune"` means the judge thought every block mattered; `"below_min_prune_ratio"` means it would have hidden less than `WINNOW_MIN_PRUNE_RATIO` of the text, so the rewrite was skipped (the usual outcome on ordinary source files at a conservative `WINNOW_DROP`). No line at all means the hook didn't run: `winnow doctor` checks the function-hooks flag; then `~/.winnow/errors.log`; then `claude --debug`, which logs `hooks module winnow@winnow loaded` when the module is in.
 5. **Everything passes through with `judge_error`.** Read `~/.winnow/errors.log`; it has the traceback. Timeouts show up as `TypeSafeAPITimeoutError`; raise `WINNOW_JUDGE_TIMEOUT` or lower `WINNOW_MAX_STATE_CHARS`.
 6. **Stubs appear but nothing is summarized.** Summaries need Anthropic credentials. `winnow doctor` shows whether they were found.
 7. **A file you need came back pruned.** Use the stub's key with `winnow_recall`, or read the range it names with `offset`/`limit`. To keep a directory out of winnow's reach entirely, add it to `WINNOW_EXCLUDE_PATHS`.
+
+## Turning it off
+
+```bash
+claude plugin disable winnow@winnow
+winnow serve --stop
+```
+
+New sessions won't load winnow. Sessions already open keep the module until they end, but after `--stop` they leave the sidecar off and pass results through untouched. `claude plugin enable winnow@winnow` turns it back on from the next session.
 
 ## Uninstall
 

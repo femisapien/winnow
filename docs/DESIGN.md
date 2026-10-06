@@ -14,7 +14,7 @@ Existing Claude Code context plugins decide what to keep with byte thresholds, d
 - `prompt.submit` appends context entries the model reads beside the prompt (`next({ ...e, context: [...] })`). The classic `UserPromptSubmit` capped its output at 10,000 characters; the selector still budgets `WINNOW_CONTEXT_MAX_CHARS` below that.
 - `PreCompact` can only block compaction, not shape the summary. Compaction stays Anthropic's.
 - MCP tool schemas are already deferred natively when they exceed 10% of context (tool search). winnow does not touch tool selection.
-- The module reads the task from the live session (`$.session.messages()`). The transcript file, which classic hooks named by `transcript_path`, is the fallback when a caller sends no task.
+- The task comes from the session's transcript. The module sends none; the sidecar reads the tail of the transcript file, a subagent's own by its agent id. 0.5.0 and 0.5.1 read it from the live session (`$.session.messages()`) instead; why that was undone is under function hooks below.
 
 ## State engineering
 
@@ -171,7 +171,9 @@ So via command hooks a result under `WINNOW_MIN_CHARS` costs about 370 ms, and a
 
 ### The resident sidecar
 
-`winnow serve` is a loopback HTTP server that keeps the SDK imported and the judge's HTTP client warm. Claude Code's `http` hooks POST the event JSON to it and read the hook output from the response body: an empty 2xx is pass-through, a JSON 2xx is the hook output, and a connection failure is a non-blocking error. The SessionStart hook runs `winnow serve --ensure`, which spawns a detached server if none answers (and replaces one from an older plugin version). The server re-reads `~/.winnow/env` when it changes, so a key or threshold edit takes effect without a restart, and exits after 45 idle minutes.
+`winnow serve` is a loopback HTTP server that keeps the SDK imported and the judge's HTTP client warm. The module POSTs each event's JSON to it and reads the answer from the response body: an empty 2xx is pass-through, a JSON 2xx is the hook output, and a connection failure means pass-through. The SessionStart hook runs `winnow serve --ensure`, which spawns a detached server if none answers (and replaces one from an older plugin version). The server re-reads `~/.winnow/env` when it changes, so a key or threshold edit takes effect without a restart, and exits after 45 idle minutes.
+
+Until 0.5.2 nothing brought it back before the next session start, so a session that sat idle that long ran unjudged from then on, with nothing to say so. One developer's logs over 18 days held 25 idle exits and 5,887 large results that passed through while the sidecar was down, against 7,435 it judged. Now a POST that reaches nobody makes the module run `winnow serve --revive` with the sidecar's own interpreter and send once more; calls that fail together share that one start. If the sidecar still cannot be reached, results pass through untried for a minute, so a dead sidecar costs nothing per call (a refused connection is not free: on Windows it took 0.7 s in the hook), and the person sees one message. `winnow serve --stop` leaves a marker that makes `--revive` decline, so a session that is already open does not bring back a sidecar someone turned off; the next session start clears it.
 
 | Path | Median |
 |---|---|
@@ -184,67 +186,12 @@ Judged results also skip the ~500 ms SDK import, and TLS reuse takes the judge r
 
 Claude Code's function hooks (early access, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, 2.1.260+) load a TypeScript module into the engine. A `tool.call` handler there sees the call, runs the tool with `next(e)`, and returns `{ result }`: the structured result Claude will read, with no JSON-on-stdout contract and no transcript path. winnow's module (`hooks/winnow.ts`) keeps the judge in the Python sidecar and changes two things:
 
-- **Task state from the live session.** `$.session.messages()` gives the conversation as the engine holds it, so the "current task" is the real last human request and the assistant's last sentence, with no file lag. Inside a subagent the messages are the subagent's own, which closes the state bug that 0.3.4 fixed on the http path by guessing the subagent's transcript file.
+- **Task state from the transcript, after all.** 0.5.0 read the task with `$.session.messages()`, expecting the conversation as the engine holds it and, inside a subagent, the subagent's own messages. Neither held. Called with no argument, `messages()` is the main conversation even inside a subagent, so from 0.5.0 every subagent result was judged against the orchestrator's task again: the bug 0.3.4 had fixed. And it copies the whole conversation into the module on every large result, which in one weeks-long session measured about 3.5 s per result, with the sidecar up or down. Since 0.5.2 the module sends no task. The sidecar reads the tail of the transcript (at most 2 MB), the subagent's own file when the call carries an agent id, and finds the file by session id when the session has moved to another directory since it started.
 - **Visible decisions.** The sidecar puts a summary of each rewrite in an `X-Winnow` response header (blocks hidden, characters before and after, the recall key) and the module shows it as a toast; the sidecar's "judge could not start" notice becomes a toast too. Http hooks had no channel for that.
 
 0.4.0 shipped the module beside the http hooks with a dedupe layer so both could fire. Both did fire in a live session on 2026-09-18, and the http hook reached the sidecar first every time, so the module's better task state went unused. 0.5.0 dropped the http hooks (a deliberate break: no backward compatibility, so the plugin has one path and no race) and the dedupe with them. The cost is that the flag is now required; `winnow doctor` reports when it is missing, because a module that never loads fails silently.
 
-Everything that was measured stays measured: the same extraction, chunking, questions, thresholds and cache, so the calibration numbers above apply unchanged. The module's own tests run under `claude plugin test`, which loads the plugin into an engine with no network, so they cover task reconstruction and the pass-through path (sidecar down, small result, denied call). The live check is `claude --debug`, which logs `hooks module winnow@winnow loaded ... events: tool.call,prompt.submit` and a settle time per event. First live run on 2026-09-18 (headless, 0.5.0): a 25 KB README read against a one-line question was judged in 517 ms, 27 of 28 blocks hidden, the toast logged, the whole `tool.call` settled in 697 ms including the Read itself, and Claude answered correctly from the block that stayed. One trap found on the way: Claude Code's Read refuses files over 256 KB with a one-line error string as the result, so the module sees a short string there and nothing reaches the sidecar.
-
-The engine also offers `session.compact` (2.1.274+), where a hook can replace the compaction result. That is the layer fast-jev-compaction works at; winnow's calibrated block question could run there over whole results before the summary, and the harness can tell whether it should.
-
-### An open judge? jevlike on the same harness
-
-[jevlike](https://github.com/vinnylarouge/jevlike) is an independent open model with Jev's shape (context plus N options, one probability each), trainable on your own rows. Since winnow's judge interface is vendor-neutral, the obvious question is whether a small local model trained on the replay data can stand in for Jev without a key. `docs/experiments/jevlike_experiment.py` turns the 300 replay cases into jevlike rows (context = task + tool + block, options `needed` / `not needed`, label = the weak label), keeps whole transcripts in one split (6 transcripts; 1,043 / 277 / 195 blocks), trains, and scores the held-out 195 blocks with the same `score()` as everything else. Jev's and the lexical judge's records were rescored on exactly those 50 cases.
-
-| judge on the 195 held-out blocks (weak labels) | ECE | AUC |
-|---|---|---|
-| Jev, default questions | 0.141 | 0.701 |
-| Jev, structured questions | 0.175 | 0.701 |
-| lexical baseline (no model) | 0.313 | 0.635 |
-| jevlike, byte encoder from scratch (16 s on CPU) | 0.315 | 0.453 |
-| jevlike, frozen Qwen2.5-0.5B + head, lr 2e-3 (5 min on an RTX 4060) | 0.168 | 0.566 |
-| jevlike, frozen Qwen2.5-0.5B + head, lr 2e-4 (8 min) | 0.135 | 0.497 |
-
-Two things came out of this, and the second matters more than the first.
-
-The first: with a thousand weak labels, jevlike is not a judge. From scratch it is below a coin flip. With a pretrained encoder it learns something (AUC 0.57) but its ranking is bumpy and its validation loss never beat the base rate for long; the low-learning-rate run converged to predicting the base rate for every block. Files: `docs/results/2026-09-18/`. This is what one would expect from 1k noisy examples, not a verdict on the architecture; ten thousand hand-checked labels would be a different experiment.
-
-The second: **the lr 2e-4 run has the best ECE in the table and is useless.** A judge that says 0.5 to everything is perfectly calibrated on a 48%-needed workload and can hide nothing. Calibration was the headline number in the earlier sections because the threshold question is a calibration question, but it cannot stand alone. `score()` now reports ROC AUC beside ECE (the chance a needed block scores above a not-needed one; 0.5 is a coin flip), and every report prints both. On these blocks Jev's ordering is 0.70 against weak labels, which is real but not dramatic; the lexical baseline's 0.64 says that task-word overlap carries a good part of the signal. What separates Jev is that its low tail is clean (the calibration bins above), which is the part a threshold uses.
-
-## Latency, measured
-
-`winnow bench` on this machine (Windows 11, Python 3.14, warm disk):
-
-| Path | Median |
-|---|---|
-| interpreter only | 92 ms |
-| small result, `python -m winnow` (fast path, no SDK import) | 274 ms |
-| small result via `uv run` (what Claude Code runs) | 374 ms |
-| interpreter + `import typesafe_sdk` | 566 ms |
-
-So via command hooks a result under `WINNOW_MIN_CHARS` costs about 370 ms, and a judged result about 850 ms before the request leaves, of which about 470 ms is importing the SDK (mostly `httpx2` reading package metadata).
-
-### The resident sidecar
-
-`winnow serve` is a loopback HTTP server that keeps the SDK imported and the judge's HTTP client warm. Claude Code's `http` hooks POST the event JSON to it and read the hook output from the response body: an empty 2xx is pass-through, a JSON 2xx is the hook output, and a connection failure is a non-blocking error. The SessionStart hook runs `winnow serve --ensure`, which spawns a detached server if none answers (and replaces one from an older plugin version). The server re-reads `~/.winnow/env` when it changes, so a key or threshold edit takes effect without a restart, and exits after 45 idle minutes.
-
-| Path | Median |
-|---|---|
-| small result via `uv run` command hook | 381 ms |
-| small result via the sidecar | **16 ms** |
-
-Judged results also skip the ~500 ms SDK import, and TLS reuse takes the judge round trip itself from the 300–500 ms range down toward the 90 ms Jev shows in replay. If the sidecar is down, results pass through unjudged and Claude Code shows the hook error; `winnow doctor` and `winnow serve --status` both report it.
-
-### Function hooks: the same judge, in-process
-
-Claude Code's function hooks (early access, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, 2.1.260+) load a TypeScript module into the engine. A `tool.call` handler there sees the call, runs the tool with `next(e)`, and returns `{ result }`: the structured result Claude will read, with no JSON-on-stdout contract and no transcript path. winnow's module (`hooks/winnow.ts`) keeps the judge in the Python sidecar and changes three things:
-
-- **Task state from the live session.** `$.session.messages()` gives the conversation as the engine holds it, so the "current task" is the real last human request and the assistant's last sentence, with no file lag. Inside a subagent the messages are the subagent's own, which closes the state bug that 0.3.4 fixed on the http path by guessing the subagent's transcript file.
-- **Visible decisions.** The sidecar puts a summary of each rewrite in an `X-Winnow` response header (blocks hidden, characters before and after, the recall key) and the module shows it as a toast. Http hooks have no channel for that.
-- **No double judging.** Both paths fire for the same call when the flag is on, and the http hook may arrive with the already-rewritten text. The sidecar keys its last 512 answers by `tool_use_id` and returns the same answer for a repeat, so the rewrite is idempotent whichever path reaches Claude last; a prompt seen again within 30 s gets nothing back, since context must be injected once.
-
-Everything that was measured stays measured: the same extraction, chunking, questions, thresholds and cache, so the calibration numbers above apply unchanged. The module's own tests run under `claude plugin test`, which loads the plugin into an engine with no network, so they cover task reconstruction and the pass-through path (sidecar down, small result, denied call). A live session with the flag on had not been run when this was written; the first one should confirm that the toast appears, that `deduped` climbs in `winnow serve --status`, and that decision lines carry `"source": "function-hook"`.
+Everything that was measured stays measured: the same extraction, chunking, questions, thresholds and cache, so the calibration numbers above apply unchanged. The module's own tests run under `claude plugin test`, which loads the plugin into an engine with no network, so they cover the restart logic and the pass-through path (sidecar down and impossible to start, small result, denied call). The live check is `claude --debug`, which logs `hooks module winnow@winnow loaded ... events: tool.call,prompt.submit` and a settle time per event. First live run on 2026-09-18 (headless, 0.5.0): a 25 KB README read against a one-line question was judged in 517 ms, 27 of 28 blocks hidden, the toast logged, the whole `tool.call` settled in 697 ms including the Read itself, and Claude answered correctly from the block that stayed. One trap found on the way: Claude Code's Read refuses files over 256 KB with a one-line error string as the result, so the module sees a short string there and nothing reaches the sidecar.
 
 The engine also offers `session.compact` (2.1.274+), where a hook can replace the compaction result. That is the layer fast-jev-compaction works at; winnow's calibrated block question could run there over whole results before the summary, and the harness can tell whether it should.
 

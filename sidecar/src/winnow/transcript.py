@@ -71,8 +71,10 @@ def transcript_for(payload: dict) -> str | None:
     agent_id = payload.get("agent_id")
     session_id = payload.get("session_id")
     if not path and session_id and payload.get("cwd"):
-        # A function-hook call carries no transcript path; Claude Code's layout is predictable.
-        path = guess_transcript_path(str(payload["cwd"]), str(session_id))
+        # A function-hook call carries no transcript path. Claude Code files the transcript under the
+        # directory the session started in, which is not the working directory once the session moves.
+        guess = guess_transcript_path(str(payload["cwd"]), str(session_id))
+        path = guess if os.path.exists(guess) else (find_transcript(str(session_id)) or guess)
     if path and agent_id and session_id:
         candidate = os.path.join(os.path.dirname(str(path)), str(session_id), "subagents", f"agent-{agent_id}.jsonl")
         if os.path.exists(candidate):
@@ -86,8 +88,40 @@ def guess_transcript_path(cwd: str, session_id: str) -> str:
     The project directory is the working directory with every character that is
     not a letter or digit replaced by ``-`` (``C:\\Work\\app`` becomes ``C--Work-app``).
     """
-    root = os.environ.get("WINNOW_TRANSCRIPTS_ROOT") or os.path.join(os.path.expanduser("~"), ".claude", "projects")
-    return os.path.join(root, re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{session_id}.jsonl")
+    return os.path.join(_projects_root(), re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{session_id}.jsonl")
+
+
+def _projects_root() -> str:
+    return os.environ.get("WINNOW_TRANSCRIPTS_ROOT") or os.path.join(os.path.expanduser("~"), ".claude", "projects")
+
+
+_found: dict[tuple[str, str], str] = {}
+
+
+def find_transcript(session_id: str) -> str | None:
+    """The transcript of ``session_id`` in whichever project directory holds it.
+
+    A session that changed directory keeps writing under the one it started in, so
+    the guess from its current working directory misses. Remembered per session.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        return None  # the id becomes a file name here; nothing that could leave the directory
+    root = _projects_root()
+    known = _found.get((root, session_id))
+    if known is not None and os.path.exists(known):
+        return known
+    try:
+        projects = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in projects:
+        candidate = os.path.join(root, name, f"{session_id}.jsonl")
+        if os.path.isfile(candidate):
+            if len(_found) >= 1024:
+                _found.clear()
+            _found[(root, session_id)] = candidate
+            return candidate
+    return None
 
 
 def task_from_payload(payload: dict, *, max_chars: int = 1500) -> Task | None:

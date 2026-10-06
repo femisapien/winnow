@@ -1,11 +1,12 @@
 import json
 import threading
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
-from winnow import serve
+from winnow import __version__, cli, serve
 from winnow.config import Config
 from winnow.hooks import Runtime
 
@@ -161,3 +162,51 @@ def test_a_bad_content_length_is_a_400_not_a_dropped_or_held_connection(server, 
     srv, _ = server
     reply = _raw_post(srv, bad)
     assert reply.startswith(b"HTTP/1.0 400") or reply.startswith(b"HTTP/1.1 400"), reply[:60]
+
+
+def test_stop_keeps_open_sessions_from_starting_it_until_a_session_starts(cfg, monkeypatch, capsys):
+    monkeypatch.setattr(serve, "stop", lambda port=serve.DEFAULT_PORT: True)
+    assert cli.main(["serve", "--stop"]) == 0
+    assert serve.is_stopped()
+    assert "will not restart it" in capsys.readouterr().out
+    # The module in a session that was already open asks for it back: refused, nothing started.
+    monkeypatch.setattr(serve, "ensure", lambda *a, **k: pytest.fail("a sidecar stopped on purpose was started"))
+    assert cli.main(["serve", "--revive"]) == serve.REVIVE_STOPPED
+    # A session starting (the SessionStart hook) is someone wanting winnow again.
+    monkeypatch.setattr(serve, "ensure", lambda *a, **k: True)
+    assert cli.main(["serve", "--ensure"]) == 0
+    assert not serve.is_stopped()
+
+
+def test_revive_starts_a_sidecar_that_exited(cfg, monkeypatch):
+    started = []
+    monkeypatch.setattr(serve, "health", lambda port=serve.DEFAULT_PORT, timeout=0.5: None)
+    monkeypatch.setattr(serve, "ensure", lambda port=serve.DEFAULT_PORT, wait_s=8.0: started.append(port) or True)
+    assert serve.revive(1234) == serve.REVIVE_STARTED
+    assert started == [1234]
+
+
+def test_revive_says_so_when_the_sidecar_was_answering_all_along(cfg, monkeypatch):
+    # The POST failed for another reason (a timeout, say); resending would only repeat it.
+    monkeypatch.setattr(serve, "health", lambda port=serve.DEFAULT_PORT, timeout=0.5: {"version": __version__})
+    monkeypatch.setattr(serve, "ensure", lambda *a, **k: pytest.fail("nothing needed starting"))
+    assert serve.revive(1234) == serve.REVIVE_RUNNING
+
+
+def test_revive_replaces_a_sidecar_from_another_version(cfg, monkeypatch):
+    monkeypatch.setattr(serve, "health", lambda port=serve.DEFAULT_PORT, timeout=0.5: {"version": "0.0.1"})
+    monkeypatch.setattr(serve, "ensure", lambda port=serve.DEFAULT_PORT, wait_s=8.0: True)
+    assert serve.revive(1234) == serve.REVIVE_STARTED
+
+
+def test_a_revive_that_cannot_start_one_says_so(cfg, monkeypatch):
+    monkeypatch.setattr(serve, "health", lambda port=serve.DEFAULT_PORT, timeout=0.5: None)
+    monkeypatch.setattr(serve, "ensure", lambda port=serve.DEFAULT_PORT, wait_s=8.0: False)
+    assert serve.revive(1234) == serve.REVIVE_FAILED
+
+
+def test_the_revive_exit_codes_match_the_module():
+    """The module reads these numbers; drift on either side would read a start as a failure."""
+    module = (Path(__file__).resolve().parents[2] / "hooks" / "winnow.ts").read_text(encoding="utf-8")
+    for name in ("STARTED", "STOPPED", "RUNNING"):
+        assert f"const REVIVE_{name} = {getattr(serve, f'REVIVE_{name}')}" in module
