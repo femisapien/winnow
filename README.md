@@ -246,7 +246,7 @@ First results on 300 real cases, 97 blind hand labels, three question sets and t
 
 ## How it hooks in
 
-winnow is a Claude Code **function-hook** plugin: a TypeScript module, [`hooks/winnow.ts`](hooks/winnow.ts), that the engine loads in-process. Its `tool.call` handler wraps every Read, Bash and Grep call, hands the result to the sidecar (which reads the task from the session's transcript), and returns the sidecar's rewrite as the tool's result; its `prompt.submit` handler appends the selected context files to the prompt. Function hooks are early access, behind a flag; winnow is tested on Claude Code 2.1.277 and later. Without the flag the module never loads and winnow does nothing; `winnow doctor` says so.
+winnow is a Claude Code **function-hook** plugin: a TypeScript module, [`hooks/winnow.ts`](hooks/winnow.ts), that the engine loads in-process. Its `tool.call` handler wraps every Read, Bash and Grep call, hands the result to the sidecar (which reads the task from the session's transcript), and returns the sidecar's rewrite as the tool's result; its `prompt.submit` handler appends the selected context files to the prompt. Function hooks are early access, behind a flag; winnow is tested on Claude Code 2.1.277 and later. On 2.1.277 a subagent's tool calls don't reach the module, so they pass through untouched; on 2.1.286 they are judged like any other. Without the flag the module never loads and winnow does nothing; `winnow doctor` says so.
 
 When a result is rewritten you see a toast: `winnow: hid 3 of 8 blocks of Read (5.1k to 1.8k chars; winnow_recall ab12)`. Small results never leave the process; the judging, thresholds and cache are all in the Python sidecar, so nothing measured below changes with the hook mechanism.
 
